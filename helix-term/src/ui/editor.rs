@@ -8,7 +8,7 @@ use crate::{
 
 use helix_core::{
     coords_at_pos,
-    syntax::{self, HighlightEvent},
+    syntax::{self, Highlight, HighlightEvent},
     Position, Range,
 };
 use helix_view::{
@@ -136,8 +136,71 @@ impl EditorView {
         let mut line = 0u16;
         let tab_width = doc.tab_width();
 
+        let highlights = highlights.into_iter().map(|event| match event.unwrap() {
+            // convert byte offsets to char offset
+            HighlightEvent::Source { start, end } => {
+                let start = text.byte_to_char(start);
+                let end = text.byte_to_char(end);
+                HighlightEvent::Source { start, end }
+            }
+            event => event,
+        });
+
+        let selections = doc.selection(view.id);
+
+        let selection_scope = theme
+            .scopes()
+            .iter()
+            .position(|scope| scope == "ui.selection")
+            .expect("no selection scope found!");
+
+        // inject selections as highlight scopes
+        let highlights = highlights.flat_map(|event| match event {
+            HighlightEvent::Source { start, end } => {
+                let range = selections
+                    .iter()
+                    .find(|range| range.overlaps(&Range::new(start, end)));
+
+                if let Some(range) = range {
+                    let range_from = range.from();
+                    let range_to = range.to() + 1;
+
+                    let intersection_start = std::cmp::max(range_from, start);
+                    let intersection_end = std::cmp::min(range_to, end);
+
+                    let mut iter = Vec::new();
+
+                    if start < intersection_start {
+                        iter.push(HighlightEvent::Source {
+                            start,
+                            end: intersection_start,
+                        })
+                    }
+
+                    iter.push(HighlightEvent::HighlightStart(Highlight(selection_scope)));
+                    iter.push(HighlightEvent::Source {
+                        start: intersection_start,
+                        end: intersection_end,
+                    });
+                    iter.push(HighlightEvent::HighlightEnd);
+
+                    if end > intersection_end {
+                        iter.push(HighlightEvent::Source {
+                            start: intersection_end,
+                            end,
+                        })
+                    }
+
+                    iter
+                } else {
+                    vec![event]
+                }
+            }
+            event => vec![event],
+        });
+
         'outer: for event in highlights {
-            match event.unwrap() {
+            match event {
                 HighlightEvent::HighlightStart(span) => {
                     spans.push(span);
                 }
@@ -146,29 +209,14 @@ impl EditorView {
                 }
                 HighlightEvent::Source { start, end } => {
                     // TODO: filter out spans out of viewport for now..
-
-                    // TODO: do these before iterating
-                    let start = text.byte_to_char(start);
-                    let end = text.byte_to_char(end);
-
                     let text = text.slice(start..end);
 
                     use helix_core::graphemes::{grapheme_width, RopeGraphemes};
 
-                    // TODO: scope matching: biggest union match? [string] & [html, string], [string, html] & [ string, html]
-                    // can do this by sorting our theme matches based on array len (longest first) then stopping at the
-                    // first rule that matches (rule.all(|scope| scopes.contains(scope)))
-                    // log::info!(
-                    //     "scopes: {:?}",
-                    //     spans
-                    //         .iter()
-                    //         .map(|span| theme.scopes()[span.0].as_str())
-                    //         .collect::<Vec<_>>()
-                    // );
-                    let style = match spans.first() {
-                        Some(span) => theme.get(theme.scopes()[span.0].as_str()),
-                        None => theme.get("ui.text"),
-                    };
+                    let style = spans.iter().fold(theme.get("ui.text"), |acc, span| {
+                        let style = theme.get(theme.scopes()[span.0].as_str());
+                        acc.patch(style)
+                    });
 
                     // TODO: we could render the text to a surface, then cache that, that
                     // way if only the selection/cursor changes we can copy from cache
@@ -179,7 +227,20 @@ impl EditorView {
 
                     // iterate over range char by char
                     for grapheme in RopeGraphemes::new(text) {
+                        let out_of_bounds = visual_x < view.first_col as u16
+                            || visual_x >= viewport.width + view.first_col as u16;
+
                         if grapheme == "\n" {
+                            if !out_of_bounds {
+                                // we still want to render an empty cell with the style
+                                surface.set_string(
+                                    viewport.x + visual_x - view.first_col as u16,
+                                    viewport.y + line,
+                                    " ",
+                                    style,
+                                );
+                            }
+
                             visual_x = 0;
                             line += 1;
 
@@ -188,11 +249,18 @@ impl EditorView {
                                 break 'outer;
                             }
                         } else if grapheme == "\t" {
+                            if !out_of_bounds {
+                                // we still want to render an empty cell with the style
+                                surface.set_string(
+                                    viewport.x + visual_x - view.first_col as u16,
+                                    viewport.y + line,
+                                    " ",
+                                    style,
+                                );
+                            }
+
                             visual_x += (tab_width as u16);
                         } else {
-                            let out_of_bounds = visual_x < view.first_col as u16
-                                || visual_x >= viewport.width + view.first_col as u16;
-
                             // Cow will prevent allocations if span contained in a single slice
                             // which should really be the majority case
                             let grapheme = Cow::from(grapheme);
@@ -251,72 +319,7 @@ impl EditorView {
                 .iter()
                 .filter(|range| range.overlaps(&screen))
             {
-                // TODO: render also if only one of the ranges is in viewport
-                let mut start = view.screen_coords_at_pos(doc, text, selection.anchor);
-                let mut end = view.screen_coords_at_pos(doc, text, selection.head);
-
-                let head = end;
-
-                if selection.head < selection.anchor {
-                    std::mem::swap(&mut start, &mut end);
-                }
-                let start = start.unwrap_or_else(|| Position::new(0, 0));
-                let end = end.unwrap_or_else(|| {
-                    Position::new(viewport.height as usize, viewport.width as usize)
-                });
-
-                if start.row == end.row {
-                    surface.set_style(
-                        Rect::new(
-                            viewport.x + start.col as u16,
-                            viewport.y + start.row as u16,
-                            // .min is important, because set_style does a
-                            // for i in area.left()..area.right() and
-                            // area.right = x + width !!! which shouldn't be > then surface.area.right()
-                            // This is checked by a debug_assert! in Buffer::index_of
-                            ((end.col - start.col) as u16 + 1).min(
-                                surface
-                                    .area
-                                    .width
-                                    .saturating_sub(viewport.x + start.col as u16),
-                            ),
-                            1,
-                        ),
-                        selection_style,
-                    );
-                } else {
-                    surface.set_style(
-                        Rect::new(
-                            viewport.x + start.col as u16,
-                            viewport.y + start.row as u16,
-                            // text.line(view.first_line).len_chars() as u16 - start.col as u16,
-                            viewport.width.saturating_sub(start.col as u16),
-                            1,
-                        ),
-                        selection_style,
-                    );
-                    for i in start.row + 1..end.row {
-                        surface.set_style(
-                            Rect::new(
-                                viewport.x,
-                                viewport.y + i as u16,
-                                // text.line(view.first_line + i).len_chars() as u16,
-                                viewport.width,
-                                1,
-                            ),
-                            selection_style,
-                        );
-                    }
-                    surface.set_style(
-                        Rect::new(
-                            viewport.x,
-                            viewport.y + end.row as u16,
-                            (end.col as u16).min(viewport.width),
-                            1,
-                        ),
-                        selection_style,
-                    );
-                }
+                let head = view.screen_coords_at_pos(doc, text, selection.head);
 
                 // cursor
                 if let Some(head) = head {
